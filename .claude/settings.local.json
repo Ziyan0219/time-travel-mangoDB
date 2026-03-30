@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(GIT_DIR=\"C:/Users/32044/Desktop/MangoDB time travel/.git\" git log --oneline -5)",
+      "Bash(git:*)"
+    ]
+  }
+}
