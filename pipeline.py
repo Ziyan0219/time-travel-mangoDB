@@ -2,10 +2,16 @@
 Stock Price Time Travel Pipeline
 ==================================
 Orchestrates all four components and adds:
-  - Persistence     : data survives process restarts via DuckDB file
+  - Persistence     : data survives process restarts via DuckDB file or BigQuery
   - Verbose mode    : see every byte flowing through each stage
   - Edge cases      : validation, duplicates, out-of-order, unknown tickers
   - Observability   : processing lag, late event detection, data freshness
+
+BACKENDS:
+  use_bigquery=False (default)  →  DuckDB local file (bigquery_simulator.py)
+  use_bigquery=True             →  Real Google Cloud BigQuery (bigquery_client.py)
+
+  Or set USE_BIGQUERY=true in .env to switch without changing code.
 """
 
 import os
@@ -17,6 +23,16 @@ from src.pubsub_simulator import PubSubTopic
 from src.cloud_function import transform_change_event
 from src.bigquery_simulator import BigQuerySimulator
 from src.metrics import PipelineMetrics
+
+# Real BigQuery client — imported lazily so DuckDB-only installs still work
+_bigquery_client_cls = None
+
+def _get_bigquery_client_cls():
+    global _bigquery_client_cls
+    if _bigquery_client_cls is None:
+        from src.bigquery_client import BigQueryClient
+        _bigquery_client_cls = BigQueryClient
+    return _bigquery_client_cls
 
 # ── ANSI colors ────────────────────────────────────────────────────────────────
 _R    = "\033[0m"
@@ -65,44 +81,67 @@ class StockPipeline:
 
     Parameters
     ----------
-    verbose : bool   — Print a detailed trace for every price change event.
-    persist : bool   — Use a DuckDB file so data survives restarts.
-    db_path : str    — Override the DuckDB file path (when persist=True).
+    verbose      : bool — Print a detailed trace for every price change event.
+    persist      : bool — Use a DuckDB file so data survives restarts (DuckDB mode only).
+    db_path      : str  — Override the DuckDB file path (when persist=True).
+    use_bigquery : bool — Use real Google Cloud BigQuery instead of DuckDB.
+                          Defaults to the USE_BIGQUERY env var, or False.
     """
 
     def __init__(self, verbose=False, persist=False, db_path=DEFAULT_DB,
-                 read_only=False, snapshot_path=DEFAULT_SNAPSHOT):
+                 read_only=False, snapshot_path=DEFAULT_SNAPSHOT,
+                 use_bigquery=None):
         self.verbose       = verbose
         self.persist       = persist
         self.read_only     = read_only
-        self.snapshot_path = snapshot_path if persist else None
 
-        resolved_db  = db_path if persist else ":memory:"
-        is_restart   = persist and os.path.exists(resolved_db)
+        # ── Decide backend ────────────────────────────────────────────────
+        if use_bigquery is None:
+            use_bigquery = os.getenv("USE_BIGQUERY", "").lower() in ("1", "true", "yes")
+        self.use_bigquery = use_bigquery
 
         # ── Components ────────────────────────────────────────────────────
-        self.mongo    = MongoCollection("stocks")
-        self.topic    = PubSubTopic("stock-price-changes")
-        self.sub      = self.topic.subscribe("bigquery-writer")
-        self.bigquery = BigQuerySimulator(
-            db_path=resolved_db,
-            read_only=read_only,
-            snapshot_path=self.snapshot_path if not read_only else None,
-        )
-        self.metrics  = PipelineMetrics()
+        self.mongo   = MongoCollection("stocks")
+        self.topic   = PubSubTopic("stock-price-changes")
+        self.sub     = self.topic.subscribe("bigquery-writer")
+        self.metrics = PipelineMetrics()
 
         self._events_processed   = 0
         self._skipped_duplicates = 0
 
-        # ── Restart: restore MongoDB state from BigQuery ───────────────────
+        if self.use_bigquery:
+            # ── Real BigQuery backend ──────────────────────────────────────
+            BigQueryClient = _get_bigquery_client_cls()
+            self.bigquery  = BigQueryClient()
+            self.snapshot_path = None
+            is_restart = True   # BigQuery always has persistent state
+
+            if verbose:
+                print(f"{_G}[Pipeline]{_R} Backend: Google Cloud BigQuery  "
+                      f"({self.bigquery.table_id})")
+        else:
+            # ── DuckDB backend (original behavior) ────────────────────────
+            self.snapshot_path = snapshot_path if persist else None
+            resolved_db  = db_path if persist else ":memory:"
+            is_restart   = persist and os.path.exists(resolved_db)
+
+            self.bigquery = BigQuerySimulator(
+                db_path=resolved_db,
+                read_only=read_only,
+                snapshot_path=self.snapshot_path if not read_only else None,
+            )
+            if verbose:
+                mode = f"persistent ({resolved_db})" if persist else "in-memory"
+                print(f"{_G}[Pipeline]{_R} Backend: DuckDB — {mode}")
+
+        # ── Restart: restore MongoDB state from persistent storage ───────────
         if is_restart:
             self._restore_mongo_from_bigquery()
             if verbose:
+                n = len(self.mongo.find_all())
+                backend = "BigQuery" if self.use_bigquery else "DuckDB"
                 print(f"{_G}[Pipeline]{_R} Restarted — "
-                      f"restored {len(self.mongo.find_all())} tickers from {resolved_db}")
-        elif verbose:
-            mode = f"persistent ({resolved_db})" if persist else "in-memory"
-            print(f"{_G}[Pipeline]{_R} Initialized — storage: {mode}")
+                      f"restored {n} tickers from {backend}")
 
     def _restore_mongo_from_bigquery(self):
         for ticker, price, volume, event_time in self.bigquery.get_latest_state():

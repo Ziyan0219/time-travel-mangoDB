@@ -1,3 +1,6 @@
 duckdb>=0.10.0
 pymongo>=4.6.0
 python-dotenv>=1.0.0
+
+# Real BigQuery backend (optional — only needed when USE_BIGQUERY=true)
+google-cloud-bigquery>=3.11.0

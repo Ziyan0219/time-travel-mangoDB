@@ -1,5 +1,6 @@
 # Environment — never commit credentials
 .env
+stock-time-travel-key.json
 
 # DuckDB data files — runtime state, not source code
 *.duckdb
